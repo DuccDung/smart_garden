@@ -24,6 +24,7 @@ bool relayActiveLow = true;
 // 0 = MANUAL
 // 1 = AUTO
 // 2 = SCHEDULE
+// 3 = HISTORY
 int mode = 0;
 
 // Bom
@@ -42,6 +43,8 @@ int pumpDuration = 30; // giay
 bool schedulePumpRunning = false;
 unsigned long schedulePumpStart = 0;
 int lastPumpDay = -1;
+int lastPumpHour = -1;
+int lastPumpMinute = -1;
 
 // Muc dang chinh trong che do schedule
 // 0 = gio, 1 = phut, 2 = so giay bom
@@ -52,9 +55,27 @@ int pumpCount = 0;
 unsigned long totalPumpSeconds = 0;
 float flowRate = 5.0; // ml/giay, can do thuc te
 
+const int pumpHistorySize = 20;
+int pumpHistoryNumber[pumpHistorySize] = {0};
+int pumpHistoryYear[pumpHistorySize] = {0};
+int pumpHistoryMonth[pumpHistorySize] = {0};
+int pumpHistoryDay[pumpHistorySize] = {0};
+int pumpHistoryHour[pumpHistorySize] = {0};
+int pumpHistoryMinute[pumpHistorySize] = {0};
+int pumpHistorySecond[pumpHistorySize] = {0};
+unsigned long pumpHistorySeconds[pumpHistorySize] = {0};
+unsigned long pumpHistoryWaterMl[pumpHistorySize] = {0};
+int pumpHistoryCount = 0;
+int pumpHistoryViewOffset = 0;
+
 // Chong doi nut
 unsigned long lastButtonTime = 0;
 const unsigned long debounceDelay = 250;
+
+// Bam nut Schedule 3 lan de xem lich su
+int scheduleButtonPressCount = 0;
+unsigned long firstScheduleButtonPressTime = 0;
+const unsigned long triplePressWindow = 1500;
 
 void setup() {
   Wire.begin();
@@ -121,19 +142,27 @@ void readButtons() {
   }
 
   if (digitalRead(btnManual) == LOW) {
+    if (mode == 2) {
+      setPump(false);
+    }
     mode = 0;
     schedulePumpRunning = false;
+    scheduleButtonPressCount = 0;
     lastButtonTime = millis();
   }
 
   if (digitalRead(btnAuto) == LOW) {
+    if (mode == 2) {
+      setPump(false);
+    }
     mode = 1;
     schedulePumpRunning = false;
+    scheduleButtonPressCount = 0;
     lastButtonTime = millis();
   }
 
   if (digitalRead(btnSchedule) == LOW) {
-    mode = 2;
+    handleScheduleButton();
     lastButtonTime = millis();
   }
 
@@ -150,20 +179,67 @@ void readButtons() {
     }
 
     lastButtonTime = millis();
+    scheduleButtonPressCount = 0;
   }
 
   if (digitalRead(btnUp) == LOW) {
     if (mode == 2) {
       increaseScheduleValue();
     }
+    if (mode == 3) {
+      showOlderPumpHistory();
+    }
     lastButtonTime = millis();
+    scheduleButtonPressCount = 0;
   }
 
   if (digitalRead(btnDown) == LOW) {
     if (mode == 2) {
       decreaseScheduleValue();
     }
+    if (mode == 3) {
+      showNewerPumpHistory();
+    }
     lastButtonTime = millis();
+    scheduleButtonPressCount = 0;
+  }
+}
+
+void handleScheduleButton() {
+  unsigned long nowMs = millis();
+
+  if (scheduleButtonPressCount == 0 ||
+      nowMs - firstScheduleButtonPressTime > triplePressWindow) {
+    scheduleButtonPressCount = 1;
+    firstScheduleButtonPressTime = nowMs;
+  } else {
+    scheduleButtonPressCount++;
+  }
+
+  if (scheduleButtonPressCount >= 3) {
+    if (mode == 2) {
+      setPump(false);
+      schedulePumpRunning = false;
+    }
+
+    mode = 3;
+    pumpHistoryViewOffset = 0;
+    scheduleButtonPressCount = 0;
+    return;
+  }
+
+  mode = 2;
+}
+
+void showOlderPumpHistory() {
+  if (pumpHistoryViewOffset < pumpHistoryCount - 1) {
+    pumpHistoryViewOffset++;
+  }
+}
+
+void showNewerPumpHistory() {
+  if (pumpHistoryViewOffset > 0) {
+    pumpHistoryViewOffset--;
   }
 }
 
@@ -225,14 +301,21 @@ void autoModeControl(int moisture) {
 
 void scheduleModeControl(DateTime now) {
   if (!schedulePumpRunning) {
+    bool alreadyPumpedThisSchedule =
+      now.day() == lastPumpDay &&
+      now.hour() == lastPumpHour &&
+      now.minute() == lastPumpMinute;
+
     if (now.hour() == scheduleHour &&
         now.minute() == scheduleMinute &&
-        now.day() != lastPumpDay) {
+        alreadyPumpedThisSchedule == false) {
 
       setPump(true);
       schedulePumpRunning = true;
       schedulePumpStart = millis();
       lastPumpDay = now.day();
+      lastPumpHour = now.hour();
+      lastPumpMinute = now.minute();
     }
   }
 
@@ -266,8 +349,11 @@ void setPump(bool state) {
       unsigned long runSeconds = (millis() - pumpStartTime) / 1000;
 
       if (runSeconds > 0) {
+        DateTime finishedAt = rtc.now();
+
         pumpCount++;
         totalPumpSeconds += runSeconds;
+        addPumpHistory(pumpCount, runSeconds, finishedAt);
       }
 
       pumpStartTime = 0;
@@ -275,7 +361,52 @@ void setPump(bool state) {
   }
 }
 
+void addPumpHistory(int pumpNumber, unsigned long runSeconds, DateTime finishedAt) {
+  unsigned long waterMl = (unsigned long)(runSeconds * flowRate);
+
+  if (pumpHistoryCount < pumpHistorySize) {
+    pumpHistoryNumber[pumpHistoryCount] = pumpNumber;
+    pumpHistoryYear[pumpHistoryCount] = finishedAt.year();
+    pumpHistoryMonth[pumpHistoryCount] = finishedAt.month();
+    pumpHistoryDay[pumpHistoryCount] = finishedAt.day();
+    pumpHistoryHour[pumpHistoryCount] = finishedAt.hour();
+    pumpHistoryMinute[pumpHistoryCount] = finishedAt.minute();
+    pumpHistorySecond[pumpHistoryCount] = finishedAt.second();
+    pumpHistorySeconds[pumpHistoryCount] = runSeconds;
+    pumpHistoryWaterMl[pumpHistoryCount] = waterMl;
+    pumpHistoryCount++;
+    return;
+  }
+
+  for (int i = 0; i < pumpHistorySize - 1; i++) {
+    pumpHistoryNumber[i] = pumpHistoryNumber[i + 1];
+    pumpHistoryYear[i] = pumpHistoryYear[i + 1];
+    pumpHistoryMonth[i] = pumpHistoryMonth[i + 1];
+    pumpHistoryDay[i] = pumpHistoryDay[i + 1];
+    pumpHistoryHour[i] = pumpHistoryHour[i + 1];
+    pumpHistoryMinute[i] = pumpHistoryMinute[i + 1];
+    pumpHistorySecond[i] = pumpHistorySecond[i + 1];
+    pumpHistorySeconds[i] = pumpHistorySeconds[i + 1];
+    pumpHistoryWaterMl[i] = pumpHistoryWaterMl[i + 1];
+  }
+
+  pumpHistoryNumber[pumpHistorySize - 1] = pumpNumber;
+  pumpHistoryYear[pumpHistorySize - 1] = finishedAt.year();
+  pumpHistoryMonth[pumpHistorySize - 1] = finishedAt.month();
+  pumpHistoryDay[pumpHistorySize - 1] = finishedAt.day();
+  pumpHistoryHour[pumpHistorySize - 1] = finishedAt.hour();
+  pumpHistoryMinute[pumpHistorySize - 1] = finishedAt.minute();
+  pumpHistorySecond[pumpHistorySize - 1] = finishedAt.second();
+  pumpHistorySeconds[pumpHistorySize - 1] = runSeconds;
+  pumpHistoryWaterMl[pumpHistorySize - 1] = waterMl;
+}
+
 void updateLCD(DateTime now, int moisture) {
+  if (mode == 3) {
+    updateHistoryLCD();
+    return;
+  }
+
   lcd.setCursor(0, 0);
   print2digits(now.hour());
   lcd.print(":");
@@ -341,6 +472,61 @@ void updateLCD(DateTime now, int moisture) {
     lcd.print((int)(totalPumpSeconds * flowRate));
     lcd.print("ml   ");
   }
+}
+
+void updateHistoryLCD() {
+  if (pumpHistoryCount == 0) {
+    clearLCDLine(0);
+    lcd.print("LICH SU BOM NUOC");
+    clearLCDLine(1);
+    lcd.print("Chua co du lieu");
+    clearLCDLine(2);
+    clearLCDLine(3);
+    return;
+  }
+
+  if (pumpHistoryViewOffset >= pumpHistoryCount) {
+    pumpHistoryViewOffset = pumpHistoryCount - 1;
+  }
+
+  int historyIndex = pumpHistoryCount - 1 - pumpHistoryViewOffset;
+
+  clearLCDLine(0);
+  lcd.print("LICH SU ");
+  lcd.print(pumpHistoryViewOffset + 1);
+  lcd.print("/");
+  lcd.print(pumpHistoryCount);
+  lcd.print(" #");
+  lcd.print(pumpHistoryNumber[historyIndex]);
+
+  clearLCDLine(1);
+  lcd.print("Gio: ");
+  print2digits(pumpHistoryHour[historyIndex]);
+  lcd.print(":");
+  print2digits(pumpHistoryMinute[historyIndex]);
+  lcd.print(":");
+  print2digits(pumpHistorySecond[historyIndex]);
+
+  clearLCDLine(2);
+  lcd.print("Ngay: ");
+  print2digits(pumpHistoryDay[historyIndex]);
+  lcd.print("/");
+  print2digits(pumpHistoryMonth[historyIndex]);
+  lcd.print("/");
+  lcd.print(pumpHistoryYear[historyIndex]);
+
+  clearLCDLine(3);
+  lcd.print("Bom:");
+  lcd.print(pumpHistorySeconds[historyIndex]);
+  lcd.print("s ");
+  lcd.print(pumpHistoryWaterMl[historyIndex]);
+  lcd.print("ml");
+}
+
+void clearLCDLine(int row) {
+  lcd.setCursor(0, row);
+  lcd.print("                    ");
+  lcd.setCursor(0, row);
 }
 
 void print2digits(int number) {
